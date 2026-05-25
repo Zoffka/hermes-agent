@@ -168,6 +168,9 @@ class TestConfigPrompt:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("FAL_KEY", raising=False)
+        # Keep this test about the explicit fake registry state. In normal
+        # runtime, the bundled no-key Pollinations provider satisfies image_gen.
+        monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda: None)
 
         image_gen_registry.register_provider(_FakeProvider("unavail-img", available=False))
 

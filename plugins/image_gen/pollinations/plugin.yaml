@@ -1,0 +1,6 @@
+name: pollinations
+version: 1.0.0
+description: "Free image generation via pollinations.ai (FLUX, Turbo). No API key needed."
+author: NousResearch
+kind: backend
+requires_env: []
