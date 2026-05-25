@@ -50,10 +50,12 @@ def _make_runner():
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        quick_triggers={"💋": "/btw --quiet kiss me"},
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
+    adapter._pending_messages = {}
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
@@ -76,7 +78,9 @@ def _make_runner():
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
+    runner._queued_events = {}
     runner._pending_approvals = {}
+    runner._draining = False
     runner._session_db = None
     runner._reasoning_config = None
     runner._provider_routing = {}
@@ -188,3 +192,17 @@ async def test_btw_dispatches_mid_run():
     runner._handle_background_command.assert_awaited_once()
     assert result is not None
     assert "can't run mid-turn" not in result
+
+
+@pytest.mark.asyncio
+async def test_emoji_trigger_rewrites_to_quiet_btw_mid_run():
+    """Exact emoji triggers should route to quiet /btw without interrupting."""
+    runner = _make_runner()
+    runner._handle_background_command = AsyncMock(return_value="")
+
+    result = await runner._handle_message(_make_event("💋"))
+
+    runner._handle_background_command.assert_awaited_once()
+    rewritten_event = runner._handle_background_command.await_args.args[0]
+    assert rewritten_event.text == "/btw --quiet kiss me"
+    assert result == ""

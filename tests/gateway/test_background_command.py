@@ -141,6 +141,26 @@ class TestHandleBackgroundCommand:
         assert runner._run_background_task.call_args.kwargs["event_message_id"] == "463"
 
     @pytest.mark.asyncio
+    async def test_quiet_prompt_starts_task_without_confirmation(self):
+        """--quiet runs in background but does not print the start wrapper."""
+        runner = _make_runner()
+
+        created_tasks = []
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            mock_task = MagicMock()
+            created_tasks.append(mock_task)
+            return mock_task
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            event = _make_event(text="/background --quiet kiss me")
+            result = await runner._handle_background_command(event)
+
+        assert result == ""
+        assert len(created_tasks) == 1
+
+    @pytest.mark.asyncio
     async def test_prompt_truncated_in_preview(self):
         """Long prompts are truncated to 60 chars in the confirmation message."""
         runner = _make_runner()
@@ -267,6 +287,48 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_quiet_background_completion_sends_only_agent_text(self, monkeypatch):
+        """Quiet background mode is for quick UX commands: no start/complete wrapper."""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "mwah", "messages": []}
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(side_effect=lambda text: ([], text))
+        mock_adapter.extract_images = MagicMock(side_effect=lambda text: ([], text))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        await runner._run_background_task("kiss me", source, "bg_test", quiet=True)
+
+        mock_adapter.send.assert_called_once()
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert content == "mwah"
 
     @pytest.mark.asyncio
     async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):

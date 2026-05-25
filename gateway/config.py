@@ -468,6 +468,10 @@ class GatewayConfig:
 
     # User-defined quick commands (slash commands that bypass the agent loop)
     quick_commands: Dict[str, Any] = field(default_factory=dict)
+
+    # User-defined exact-text triggers that rewrite plain messages to commands
+    # (e.g. emoji shortcuts like "💋" -> "/kiss").
+    quick_triggers: Dict[str, str] = field(default_factory=dict)
     
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
@@ -580,6 +584,7 @@ class GatewayConfig:
             },
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
+            "quick_triggers": self.quick_triggers,
             "sessions_dir": str(self.sessions_dir),
             "always_log_local": self.always_log_local,
             "stt_enabled": self.stt_enabled,
@@ -624,6 +629,16 @@ class GatewayConfig:
         if not isinstance(quick_commands, dict):
             quick_commands = {}
 
+        quick_triggers = data.get("quick_triggers", {})
+        if not isinstance(quick_triggers, dict):
+            quick_triggers = {}
+        else:
+            quick_triggers = {
+                str(trigger).strip(): str(target).strip()
+                for trigger, target in quick_triggers.items()
+                if str(trigger).strip() and str(target).strip()
+            }
+
         stt_enabled = data.get("stt_enabled")
         if stt_enabled is None:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
@@ -648,6 +663,7 @@ class GatewayConfig:
             reset_by_platform=reset_by_platform,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
+            quick_triggers=quick_triggers,
             sessions_dir=sessions_dir,
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             stt_enabled=_coerce_bool(stt_enabled, True),
@@ -731,6 +747,17 @@ def load_gateway_config() -> GatewayConfig:
                         "Ignoring invalid quick_commands in config.yaml "
                         "(expected mapping, got %s)",
                         type(qc).__name__,
+                    )
+
+            qt = yaml_cfg.get("quick_triggers")
+            if qt is not None:
+                if isinstance(qt, dict):
+                    gw_data["quick_triggers"] = qt
+                else:
+                    logger.warning(
+                        "Ignoring invalid quick_triggers in config.yaml "
+                        "(expected mapping, got %s)",
+                        type(qt).__name__,
                     )
 
             stt_cfg = yaml_cfg.get("stt")

@@ -6812,6 +6812,20 @@ class GatewayRunner:
                     # itself will produce the next user-facing message.
                     return ""
 
+        # User-defined exact-text triggers (plain message -> slash command).
+        # Useful for Matrix/mobile emoji shortcuts where typing a slash command
+        # is clumsy, while still routing through normal command access control.
+        _raw_trigger_text = (event.text or "").strip()
+        if _raw_trigger_text and not _raw_trigger_text.startswith("/"):
+            if isinstance(self.config, dict):
+                _quick_triggers = self.config.get("quick_triggers", {}) or {}
+            else:
+                _quick_triggers = getattr(self.config, "quick_triggers", {}) or {}
+            if isinstance(_quick_triggers, dict):
+                _trigger_target = _quick_triggers.get(_raw_trigger_text)
+                if isinstance(_trigger_target, str) and _trigger_target.strip():
+                    event.text = _trigger_target.strip()
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
@@ -11501,7 +11515,14 @@ class GatewayRunner:
         When it completes, sends the result back to the same chat without
         modifying the active session's conversation history.
         """
-        prompt = event.get_command_args().strip()
+        raw_prompt = event.get_command_args().strip()
+        quiet = False
+        prompt = raw_prompt
+        if raw_prompt:
+            parts = raw_prompt.split(maxsplit=1)
+            if parts[0] in {"--quiet", "--silent"}:
+                quiet = True
+                prompt = parts[1].strip() if len(parts) > 1 else ""
         if not prompt:
             return t("gateway.background.usage")
 
@@ -11523,11 +11544,14 @@ class GatewayRunner:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                quiet=quiet,
             )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
+        if quiet:
+            return ""
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
@@ -11539,6 +11563,7 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        quiet: bool = False,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -11649,7 +11674,7 @@ class GatewayRunner:
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = "" if quiet else f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
                     await adapter.send(
@@ -11687,6 +11712,8 @@ class GatewayRunner:
                     except Exception:
                         pass
             else:
+                if quiet:
+                    return
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
