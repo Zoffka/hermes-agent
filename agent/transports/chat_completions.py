@@ -599,6 +599,13 @@ class ChatCompletionsTransport(ProviderTransport):
             if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
                 reasoning_content = model_extra["reasoning_content"]
 
+        # Z.AI coding endpoint (and some other providers) put actual response
+        # content in reasoning_content while leaving msg.content empty.
+        # Fall back to reasoning_content when content is absent.
+        content = msg.content
+        if not content and reasoning_content:
+            content = reasoning_content
+
         provider_data: Dict[str, Any] = {}
         if reasoning_content is not None:
             provider_data["reasoning_content"] = reasoning_content
@@ -607,7 +614,7 @@ class ChatCompletionsTransport(ProviderTransport):
             provider_data["reasoning_details"] = rd
 
         return NormalizedResponse(
-            content=msg.content,
+            content=content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning=reasoning,

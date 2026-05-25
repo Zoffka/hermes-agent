@@ -2860,9 +2860,9 @@ class TestRunConversation:
             {"role": "assistant", "content": "old answer"},
         ]
 
-        # 6 responses: original + 2 prefill + 3 retries after prefill exhaustion
+        # Reasoning-only responses are now accepted as fallback content.
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp]),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -2872,19 +2872,18 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        assert result["final_response"] == "reasoning only"
+        assert result["api_calls"] == 1
 
-    def test_reasoning_only_response_prefill_then_empty(self, agent):
-        """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
+    def test_reasoning_only_response_uses_reasoning_fallback(self, agent):
+        """Structured reasoning-only responses are accepted as fallback content."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
             reasoning_content="structured reasoning answer",
         )
-        # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
-        agent.client.chat.completions.create.side_effect = [empty_resp] * 6
+        agent.client.chat.completions.create.side_effect = [empty_resp]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -2892,11 +2891,11 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        assert result["final_response"] == "structured reasoning answer"
+        assert result["api_calls"] == 1
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
-        """When prefill continuation produces content, it becomes the final response."""
+        """Reasoning fallback wins immediately before prefill continuation is needed."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
@@ -2915,8 +2914,8 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "Here is the actual answer."
-        assert result["api_calls"] == 2  # 1 original + 1 prefill continuation
+        assert result["final_response"] == "structured reasoning answer"
+        assert result["api_calls"] == 1
         # Prefill message should be cleaned up — no consecutive assistant messages
         roles = [m.get("role") for m in result["messages"]]
         for i in range(len(roles) - 1):
