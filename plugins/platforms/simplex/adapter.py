@@ -269,23 +269,43 @@ class SimplexAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _health_monitor(self) -> None:
-        """Force reconnect if the WebSocket has been idle too long."""
+        """Keep the daemon WebSocket alive without treating normal idle as failure.
+
+        SimpleX can be completely quiet for minutes when no messages arrive. The
+        ``websockets`` client's protocol-level ping/pong frames don't pass
+        through ``async for raw in ws``, so using only application-message
+        activity made a healthy idle connection look stale and caused a forced
+        reconnect every ~150 seconds. Probe the socket with ping first; only
+        close/reconnect when the ping itself fails.
+        """
         while self._running:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
             if not self._running:
                 break
 
+            ws = self._ws
+            if not ws:
+                continue
+
             elapsed = time.time() - self._last_ws_activity
-            if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
+            if elapsed <= HEALTH_CHECK_STALE_THRESHOLD:
+                continue
+
+            try:
+                await asyncio.wait_for(ws.ping(), timeout=10)
+                self._last_ws_activity = time.time()
+                logger.debug("SimpleX: WS idle for %.0fs, ping ok", elapsed)
+            except Exception as e:
                 logger.warning(
-                    "SimpleX: WS idle for %.0fs, forcing reconnect", elapsed
+                    "SimpleX: WS idle for %.0fs and ping failed (%s); reconnecting",
+                    elapsed,
+                    e,
                 )
                 self._last_ws_activity = time.time()
-                if self._ws:
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Inbound event handling

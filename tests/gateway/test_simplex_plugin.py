@@ -7,8 +7,10 @@ sibling platform-plugin tests on the same xdist worker.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -64,8 +66,9 @@ def test_check_requirements_true_when_configured(monkeypatch):
     assert check_requirements() is websockets_present
 
 
-def test_validate_config_uses_env_or_extra():
+def test_validate_config_uses_env_or_extra(monkeypatch):
     from gateway.config import PlatformConfig
+    monkeypatch.delenv("SIMPLEX_WS_URL", raising=False)
     # Empty extra + no env → invalid
     cfg = PlatformConfig(enabled=True)
     assert validate_config(cfg) is False
@@ -246,7 +249,76 @@ async def test_send_when_ws_not_connected_does_not_crash():
 
 
 # ---------------------------------------------------------------------------
-# 8. Inbound: filter own-echo by corrId prefix
+# 8. Health monitor: idle WebSocket ping probe
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_monitor_pings_idle_socket_instead_of_reconnecting(monkeypatch):
+    """Normal no-message idle should not force a reconnect when ping works."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+
+    monkeypatch.setattr(_simplex, "HEALTH_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(_simplex, "HEALTH_CHECK_STALE_THRESHOLD", 0.0)
+
+    mock_ws = AsyncMock()
+    mock_ws.ping = AsyncMock(return_value=0.001)
+    mock_ws.close = AsyncMock()
+    adapter._ws = mock_ws
+    adapter._running = True
+    adapter._last_ws_activity = time.time() - 999
+
+    task = asyncio.create_task(adapter._health_monitor())
+    await asyncio.sleep(0.05)
+    adapter._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert mock_ws.ping.await_count >= 1
+    mock_ws.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_reconnects_when_idle_ping_fails(monkeypatch):
+    """Only failed ping, not mere silence, should close the socket."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+
+    monkeypatch.setattr(_simplex, "HEALTH_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(_simplex, "HEALTH_CHECK_STALE_THRESHOLD", 0.0)
+
+    mock_ws = AsyncMock()
+    mock_ws.ping = AsyncMock(side_effect=RuntimeError("dead socket"))
+    mock_ws.close = AsyncMock()
+    adapter._ws = mock_ws
+    adapter._running = True
+    adapter._last_ws_activity = time.time() - 999
+
+    task = asyncio.create_task(adapter._health_monitor())
+    try:
+        for _ in range(20):
+            if mock_ws.close.await_count:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        adapter._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert mock_ws.ping.await_count >= 1
+    mock_ws.close.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 9. Inbound: filter own-echo by corrId prefix
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -302,13 +374,12 @@ async def test_standalone_send_missing_websockets(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_standalone_send_missing_url(monkeypatch):
+async def test_standalone_send_connection_failure(monkeypatch):
     monkeypatch.delenv("SIMPLEX_WS_URL", raising=False)
     pconfig = MagicMock()
-    pconfig.extra = {}
-    # We expect the URL fallback (extra+env both empty) to be empty string,
-    # producing an error. We also need websockets to be importable for the
-    # url-check branch to be reached, so skip when it's not.
+    pconfig.extra = {"ws_url": "ws://127.0.0.1:1"}
+    # Use an unroutable local port so this test is hermetic even on machines
+    # that happen to run a SimpleX daemon on the adapter's default port.
     try:
         import websockets.client  # noqa: F401
     except ImportError:
@@ -316,8 +387,6 @@ async def test_standalone_send_missing_url(monkeypatch):
 
     result = await _standalone_send(pconfig, "contact-42", "hi")
     assert isinstance(result, dict)
-    # Either error about URL or a connection attempt failure — both are valid
-    # signals that the standalone path requires configuration.
     assert "error" in result
 
 
