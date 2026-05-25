@@ -324,7 +324,7 @@ def compress_context(
     # error to the user, skip the session-rotation work entirely (no
     # session has logically ended), and let auto-compress callers detect
     # the no-op via len(returned) == len(input).
-    if getattr(agent.context_compressor, "_last_compress_aborted", False):
+    if getattr(agent.context_compressor, "_last_compress_aborted", False) is True:
         _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
         if getattr(agent, "_last_compression_summary_warning", None) != _err:
             agent._last_compression_summary_warning = _err
@@ -366,7 +366,10 @@ def compress_context(
 
     todo_snapshot = agent._todo_store.format_for_injection()
     if todo_snapshot:
-        compressed.append({"role": "user", "content": todo_snapshot})
+        # This is internal continuity state, not a new user utterance. Store it
+        # as a system message so session UIs/gateways never render it as if the
+        # user had sent it after context compression.
+        compressed.append({"role": "system", "content": todo_snapshot})
 
     agent._invalidate_system_prompt()
     new_system_prompt = agent._build_system_prompt(system_message)

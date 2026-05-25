@@ -31,6 +31,7 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
+from agent.memory_manager import StreamingContextScrubber, StreamingVisibleContextScrubber
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -167,6 +168,13 @@ class GatewayStreamConsumer:
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
+        # Internal-context filter state. The non-streaming gateway path runs
+        # sanitize_visible_context() before send, but streamed replies bypass
+        # that final-send path. Keep streaming-specific scrubbers here so
+        # context-compaction handoffs and split <memory-context> spans cannot
+        # leak through progressive edits/drafts.
+        self._visible_context_scrubber = StreamingVisibleContextScrubber()
+        self._memory_context_scrubber = StreamingContextScrubber()
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -260,6 +268,8 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._visible_context_scrubber.reset()
+        self._memory_context_scrubber.reset()
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -303,6 +313,13 @@ class GatewayStreamConsumer:
         discarded.  Partial tags at buffer boundaries are held back in
         ``_think_buffer`` until enough characters arrive to decide.
         """
+        text = self._memory_context_scrubber.feed(text)
+        if not text:
+            return
+        text = self._visible_context_scrubber.feed(text)
+        if not text:
+            return
+
         buf = self._think_buffer + text
         self._think_buffer = ""
 
@@ -393,6 +410,15 @@ class GatewayStreamConsumer:
             self._accumulated += self._think_buffer
             self._think_buffer = ""
 
+    def _flush_context_scrubbers(self) -> None:
+        """Flush held streaming context-scrubber tails before final delivery."""
+        tail = self._memory_context_scrubber.flush()
+        if tail:
+            tail = self._visible_context_scrubber.feed(tail)
+        tail += self._visible_context_scrubber.flush()
+        if tail:
+            self._accumulated += tail
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting.
@@ -448,6 +474,7 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
+                    self._flush_context_scrubbers()
                     self._flush_think_buffer()
 
                 # Decide whether to flush an edit

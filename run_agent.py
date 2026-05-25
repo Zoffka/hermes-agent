@@ -120,7 +120,13 @@ from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
+from agent.memory_manager import (
+    StreamingContextScrubber,
+    StreamingVisibleContextScrubber,
+    build_memory_context_block,
+    sanitize_context,
+    sanitize_visible_context,
+)
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -3123,14 +3129,14 @@ class AIAgent:
             else:
                 # Defensive: legacy callers without the scrubber attribute.
                 text = self._strip_think_blocks(text or "")
-            # Then feed through the stateful context scrubber so memory-context
-            # spans split across chunks cannot leak to the UI (#5719).
+            # Then feed through the stateful visible-context scrubber so
+            # internal context split across chunks cannot leak to the UI.
             scrubber = getattr(self, "_stream_context_scrubber", None)
             if scrubber is not None:
                 text = scrubber.feed(text)
             else:
                 # Defensive: legacy callers without the scrubber attribute.
-                text = sanitize_context(text)
+                text = sanitize_visible_context(text)
             # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
             if not prepended_break and not getattr(
                 self, "_current_streamed_assistant_text", ""

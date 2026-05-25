@@ -321,3 +321,52 @@ class TestAlreadySentInDraftMode:
 
         # After the regular sendMessage finalize, _already_sent is True.
         assert consumer._already_sent is True
+
+
+class TestStreamingVisibleContextScrubbing:
+    """Streaming replies must enforce the same visible-boundary scrub as final sends."""
+
+    @pytest.mark.asyncio
+    async def test_context_compaction_handoff_is_not_streamed_to_chat(self):
+        adapter = _make_draft_capable_adapter(supports_draft=False)
+        cfg = StreamConsumerConfig(
+            transport="edit", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+
+        consumer.on_delta("[CONTEXT COMPACTION — REFERENCE ONLY] private handoff\n")
+        consumer.on_delta("## Active Task\nsecret task list")
+        consumer.finish()
+        task = asyncio.create_task(consumer.run())
+        await task
+
+        assert getattr(adapter.send, "await_count") == 0
+        assert getattr(adapter.edit_message, "await_count") == 0
+        assert consumer.final_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_split_memory_context_span_is_scrubbed_from_stream(self):
+        adapter = _make_draft_capable_adapter(supports_draft=False)
+        cfg = StreamConsumerConfig(
+            transport="edit", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+
+        consumer.on_delta("Visible before.\n")
+        consumer.on_delta("<memory-")
+        consumer.on_delta("context>\n## User Representation\nsecret facts")
+        consumer.on_delta("</memory-context>\nVisible after.")
+        consumer.finish()
+        task = asyncio.create_task(consumer.run())
+        await task
+
+        send_mock = getattr(adapter, "send")
+        assert send_mock.await_count > 0
+        sent_text = send_mock.await_args.kwargs["content"]
+        assert "Visible before." in sent_text
+        assert "Visible after." in sent_text
+        assert "memory-context" not in sent_text
+        assert "User Representation" not in sent_text
+        assert "secret facts" not in sent_text

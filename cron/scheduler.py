@@ -613,6 +613,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
+    # Cron final responses are non-streaming and can bypass the live agent
+    # stream scrubber. Sanitize after optional wrapper assembly and before
+    # MEDIA extraction so leaked internal scaffolding cannot be delivered as
+    # text while legitimate attachments are still parsed normally.
+    from agent.memory_manager import sanitize_visible_context
+    delivery_content = sanitize_visible_context(delivery_content)
+
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)

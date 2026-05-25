@@ -128,6 +128,43 @@ class TestCompressionBoundaryHook:
             f"got {comp_calls!r}"
         )
 
+    def test_todo_snapshot_is_internal_system_context_not_user_message(self):
+        """Preserved todo state must not reappear as a visible user message."""
+        from run_agent import AIAgent
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=None,
+                session_id="original-session",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        agent._todo_store.write([
+            {"id": "restart", "content": "Restart gateway", "status": "in_progress"},
+        ])
+        compressor = MagicMock()
+        compressor.compress.return_value = [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_aux_model_failure_model = None
+        compressor._last_aux_model_failure_error = None
+        agent.context_compressor = compressor
+
+        compressed, _ = agent._compress_context([{"role": "user", "content": "m"}], "sys", approx_tokens=100)
+
+        todo_msgs = [
+            msg for msg in compressed
+            if "active task list was preserved" in msg.get("content", "")
+        ]
+        assert todo_msgs
+        assert all(msg["role"] == "system" for msg in todo_msgs)
+
     def test_hook_failure_does_not_break_compression(self):
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB

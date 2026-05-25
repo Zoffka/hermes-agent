@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.memory_manager import sanitize_context
+from agent.memory_manager import sanitize_visible_context
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
@@ -1129,8 +1129,8 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        clean_user_content = sanitize_visible_context(user_content or "").strip()
+        clean_assistant_content = sanitize_visible_context(assistant_content or "").strip()
 
         def _sync():
             try:

@@ -76,6 +76,27 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
+def sanitize_internal_context_from_event(event) -> None:
+    """Remove internal context scaffolding from inbound platform events.
+
+    Users can reply to, quote, or paste a previous leaked ``<memory-context>``
+    block. That block is trusted system context when Hermes injects it, but it
+    must never re-enter the next turn as user-authored text or reply/channel
+    context. Restart/compaction notes are likewise internal gateway scaffolding,
+    not user text. Scrub all normalized text-bearing fields at the platform
+    boundary.
+    """
+    try:
+        from agent.memory_manager import sanitize_visible_context
+    except Exception:
+        return
+
+    for attr in ("text", "reply_to_text", "channel_context"):
+        value = getattr(event, attr, None)
+        if isinstance(value, str) and value:
+            setattr(event, attr, sanitize_visible_context(value))
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -3171,6 +3192,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        sanitize_internal_context_from_event(event)
         coerce_plaintext_gateway_command(event)
         
         session_key = build_session_key(
@@ -3457,6 +3479,12 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                try:
+                    from agent.memory_manager import sanitize_visible_context
+                    response = sanitize_visible_context(response)
+                except Exception:
+                    pass
+
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used

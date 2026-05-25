@@ -269,6 +269,58 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_background_result_scrubs_visible_context_scaffolding(self, monkeypatch):
+        """Background completions must not leak compaction/memory context to chat."""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={
+                "final_response": (
+                    "<memory-context>secret</memory-context>"
+                    "[System note: Your previous turn in this session was interrupted.]"
+                    "Clean kiss."
+                ),
+                "messages": [],
+            }
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(side_effect=lambda text: ([], text))
+        mock_adapter.extract_images = MagicMock(side_effect=lambda text: ([], text))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        await runner._run_background_task("kiss me", source, "bg_test")
+
+        mock_adapter.send.assert_called_once()
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert "memory-context" not in content
+        assert "System note" not in content
+        assert "secret" not in content
+        assert "Clean kiss." in content
+
+    @pytest.mark.asyncio
     async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):
         """Background completion metadata must let Telegram send thread id plus reply id."""
         from gateway import run as gateway_run

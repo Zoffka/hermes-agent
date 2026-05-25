@@ -6,7 +6,13 @@ regex can't survive chunk boundaries, so _fire_stream_delta routes deltas
 through a stateful scrubber.
 """
 
-from agent.memory_manager import StreamingContextScrubber, sanitize_context
+from agent.memory_manager import (
+    StreamingContextScrubber,
+    StreamingVisibleContextScrubber,
+    sanitize_context,
+    sanitize_history_context,
+    sanitize_visible_context,
+)
 
 
 class TestStreamingContextScrubberBasics:
@@ -186,6 +192,166 @@ class TestSanitizeContextUnchanged:
         )
         out = sanitize_context(leaked).strip()
         assert out == "Visible"
+
+
+class TestSanitizeHistoryContext:
+    def test_pasted_memory_context_is_removed_but_surrounding_user_text_stays(self):
+        leaked = (
+            "Can you fix it?\n\n"
+            "<memory-context>\n"
+            "[System note: The following is recalled memory context, NOT new user input.]\n"
+            "## User Representation\nsecret facts\n"
+            "## AI Identity Card\nsecret identity\n"
+            "</memory-context>\n"
+            "actual trailing user text"
+        )
+        out = sanitize_history_context(leaked)
+        assert "Can you fix it?" in out
+        assert "actual trailing user text" in out
+        assert "memory-context" not in out
+        assert "User Representation" not in out
+        assert "secret" not in out
+
+    def test_unclosed_memory_context_in_history_drops_remainder(self):
+        leaked = (
+            "Can you fix it?\n\n"
+            "<memory-context>\n"
+            "## User Representation\nsecret facts that arrived in a split Matrix chunk"
+        )
+        assert sanitize_history_context(leaked) == "Can you fix it?\n\n"
+
+    def test_compaction_handoff_remains_valid_history_context(self):
+        handoff = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n"
+            "## Active Task\nkeep this model-input handoff"
+        )
+        assert sanitize_history_context(handoff) == handoff
+
+
+class TestSanitizeVisibleContext:
+    def test_compaction_summary_is_not_user_visible(self):
+        leaked = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n"
+            "## Active Task\nsecret handoff"
+        )
+        assert sanitize_visible_context(leaked) == ""
+        # Internal replay sanitization must stay narrow; compacted summaries are
+        # valid model input and should not be stripped from conversation history.
+        assert sanitize_context(leaked) == leaked
+
+    def test_compaction_summary_without_reference_only_is_not_user_visible(self):
+        leaked = "[CONTEXT COMPACTION] Summary of private handoff"
+        assert sanitize_visible_context(leaked) == ""
+
+    def test_restart_resume_note_prefix_is_removed_from_visible_text(self):
+        leaked = (
+            "[System note: Your previous turn in this session was interrupted "
+            "by gateway shutdown. The conversation history below is intact.]\n\n"
+            "Actual answer."
+        )
+        assert sanitize_visible_context(leaked) == "Actual answer."
+
+    def test_preserved_todo_injection_is_not_user_visible(self):
+        leaked = (
+            "[Your active task list was preserved across context compression]\n"
+            "- [>] trace. Trace which visible-output path leaked raw memory context (in_progress)\n"
+            "- [ ] patch. Patch sanitizer at the missed boundary (pending)\n"
+        )
+        assert sanitize_visible_context(leaked) == ""
+
+    def test_preserved_todo_injection_prefix_removed_but_answer_preserved(self):
+        leaked = (
+            "[Your active task list was preserved across context compression]\n"
+            "- [>] trace. Trace which visible-output path leaked raw memory context (in_progress)\n"
+            "Actual answer."
+        )
+        assert sanitize_visible_context(leaked) == "Actual answer."
+
+    def test_fenced_memory_context_leaves_no_empty_code_block(self):
+        leaked = (
+            "Please fix this.\n\n"
+            "```\n"
+            "<memory-context>\n"
+            "## User Representation\nsecret facts\n"
+            "</memory-context>\n"
+            "```\n"
+            "Actual user text."
+        )
+        out = sanitize_visible_context(leaked)
+        assert out == "Please fix this.\n\nActual user text."
+        assert "```" not in out
+        assert "memory-context" not in out
+        assert "secret" not in out
+
+    def test_html_escaped_memory_context_is_removed(self):
+        leaked = (
+            "Please fix this.\n"
+            "&lt;memory-context&gt;\n"
+            "## User Representation\nsecret facts\n"
+            "&lt;/memory-context&gt;\n"
+            "Actual user text."
+        )
+        out = sanitize_visible_context(leaked)
+        assert out == "Please fix this.\n\nActual user text."
+        assert "&lt;memory-context" not in out
+        assert "secret" not in out
+
+    def test_unclosed_fenced_memory_context_drops_from_fence_line(self):
+        leaked = (
+            "Please fix this.\n\n"
+            "```text\n"
+            "<memory-context>\n"
+            "## User Representation\nsecret facts that arrived split"
+        )
+        assert sanitize_visible_context(leaked) == "Please fix this.\n\n"
+
+
+class TestStreamingVisibleContextScrubber:
+    def test_streamed_compaction_prefix_split_across_deltas_is_suppressed(self):
+        s = StreamingVisibleContextScrubber()
+        deltas = [
+            "[CONTEXT",
+            " COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n",
+            "## Active Task\nsecret handoff",
+        ]
+        out = "".join(s.feed(d) for d in deltas) + s.flush()
+        assert out == ""
+
+    def test_streamed_restart_note_split_across_deltas_strips_note_only(self):
+        s = StreamingVisibleContextScrubber()
+        deltas = [
+            "[System note: Your previous turn in this session",
+            " was interrupted by gateway restart. History intact.]\n\n",
+            "Actual answer.",
+        ]
+        out = "".join(s.feed(d) for d in deltas) + s.flush()
+        assert out == "Actual answer."
+
+    def test_streamed_preserved_todo_block_split_across_deltas_is_suppressed(self):
+        s = StreamingVisibleContextScrubber()
+        deltas = [
+            "[Your active task list was preserved",
+            " across context compression]\n",
+            "- [>] trace. Trace leak path (in_progress)\n",
+            "- [ ] patch. Patch missed boundary (pending)\n",
+        ]
+        out = "".join(s.feed(d) for d in deltas) + s.flush()
+        assert out == ""
+
+    def test_streamed_preserved_todo_block_strips_but_preserves_answer(self):
+        s = StreamingVisibleContextScrubber()
+        deltas = [
+            "[Your active task list was preserved across context compression]\n",
+            "- [>] trace. Trace leak path (in_progress)\n",
+            "Actual answer.",
+        ]
+        out = "".join(s.feed(d) for d in deltas) + s.flush()
+        assert out == "Actual answer."
+
+    def test_plain_bracketed_text_eventually_passes_through(self):
+        s = StreamingVisibleContextScrubber()
+        out = s.feed("[Cool") + s.feed(" story] visible") + s.flush()
+        assert out == "[Cool story] visible"
 
 
 class TestStreamingContextScrubberCrossTurn:

@@ -41,22 +41,129 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _FENCE_TAG_RE = re.compile(r'</?\s*memory-context\s*>', re.IGNORECASE)
+_ESCAPED_FENCE_TAG_RE = re.compile(
+    r'&lt;\s*(/?)\s*(memory-context|prior_memory_file)\s*&gt;',
+    re.IGNORECASE,
+)
+_INLINE_CODE_FENCE_TAG_RE = re.compile(
+    r'`(<\s*/?\s*(?:memory-context|prior_memory_file)\s*>)`',
+    re.IGNORECASE,
+)
+_EMPTY_CODE_FENCE_RE = re.compile(
+    r'(?m)^[ \t]*```[^\n]*\n[ \t\r\n]*?^[ \t]*```[ \t]*(?:\n|$)'
+)
 _INTERNAL_CONTEXT_RE = re.compile(
     r'<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
+_PRIOR_MEMORY_FILE_RE = re.compile(
+    r'<\s*prior_memory_file\s*>[\s\S]*?</\s*prior_memory_file\s*>',
     re.IGNORECASE,
 )
 _INTERNAL_NOTE_RE = re.compile(
     r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
     re.IGNORECASE,
 )
+_VISIBLE_CONTEXT_COMPACTION_PREFIX_RE = re.compile(
+    r'^\s*\[CONTEXT COMPACTION\b[^\]]*\]',
+    re.IGNORECASE,
+)
+_VISIBLE_RESTART_NOTE_RE = re.compile(
+    r'^\s*\[System note:\s*Your previous turn in this session was interrupted[^\]]*\]\s*',
+    re.IGNORECASE | re.DOTALL,
+)
+_VISIBLE_TODO_PRESERVED_RE = re.compile(
+    r'^\s*\[Your active task list was preserved across context compression\]\s*\n?'
+    r'(?:\s*- \[[^\]]+\] [^\n]*(?:\n|$))*',
+    re.IGNORECASE,
+)
+
+
+def _normalize_internal_context_markers(text: str) -> str:
+    """Canonicalize internal-context tags before regex stripping.
+
+    Matrix clients and markdown renderers can preserve a leaked block as HTML
+    entities (``&lt;memory-context&gt;``) or wrap just the tag in inline code.
+    Convert only these known marker forms so the existing scrubbers catch the
+    block without globally unescaping user text.
+    """
+    text = _ESCAPED_FENCE_TAG_RE.sub(lambda m: f"<{'/' if m.group(1) else ''}{m.group(2).lower()}>", text)
+    text = _INLINE_CODE_FENCE_TAG_RE.sub(r'\1', text)
+    return text
+
+
+def _cleanup_empty_internal_fences(text: str) -> str:
+    """Remove empty markdown fences left after stripping a fenced leak."""
+    return _EMPTY_CODE_FENCE_RE.sub('', text)
 
 
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
+    text = _normalize_internal_context_markers(text)
     text = _INTERNAL_CONTEXT_RE.sub('', text)
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
-    return text
+    return _cleanup_empty_internal_fences(text)
+
+
+def sanitize_history_context(text: str) -> str:
+    """Strip leaked memory fences from persisted/user history before model replay.
+
+    This is stricter than ``sanitize_context`` for memory/prior-memory fences:
+    if a client split or stored an opening tag without the close tag, drop the
+    rest of that message rather than replaying private memory payload as user
+    text.  It is deliberately narrower than ``sanitize_visible_context`` so
+    context-compaction handoff summaries remain valid model input when a session
+    is resumed.
+    """
+    text = _normalize_internal_context_markers(text)
+    text = _INTERNAL_CONTEXT_RE.sub('', text)
+    text = _PRIOR_MEMORY_FILE_RE.sub('', text)
+    text = re.sub(
+        r'(?im)^[ \t]*(?:```[^\n]*\n)?[ \t]*<\s*(?:memory-context|prior_memory_file)\s*>[\s\S]*$',
+        '',
+        text,
+    )
+    text = _INTERNAL_NOTE_RE.sub('', text)
+    text = _FENCE_TAG_RE.sub('', text)
+    return _cleanup_empty_internal_fences(text)
+
+
+def sanitize_visible_context(text: str) -> str:
+    """Strip internal context that must never be sent to chat surfaces.
+
+    ``sanitize_context`` is deliberately narrow because compacted summaries are
+    valid *model input* when replaying a long session. Chat delivery has a
+    stricter boundary: if a model parrots the context-compaction handoff or the
+    restart-resume system note, drop it instead of showing sysadmin underwear to
+    the user.
+
+    Matrix and other clients can split very long pasted messages across events.
+    One chunk may contain ``<memory-context>`` without the closing tag; at a
+    visible/inbound boundary the safe behaviour is to drop everything from the
+    opening tag onward rather than remove only the tag and leak the payload.
+    """
+    text = _normalize_internal_context_markers(text)
+    # First remove complete fenced spans.
+    text = _INTERNAL_CONTEXT_RE.sub('', text)
+    text = _PRIOR_MEMORY_FILE_RE.sub('', text)
+    # At visible boundaries, treat an unterminated opening fence as "drop the
+    # remainder". This catches Matrix/client split chunks before batching sees
+    # the matching close tag. Include an optional preceding markdown code fence
+    # because old leaks were often displayed/quoted as fenced blocks.
+    text = re.sub(
+        r'(?im)^[ \t]*(?:```[^\n]*\n)?[ \t]*<\s*(?:memory-context|prior_memory_file)\s*>[\s\S]*$',
+        '',
+        text,
+    )
+    text = _INTERNAL_NOTE_RE.sub('', text)
+    text = _FENCE_TAG_RE.sub('', text)
+    text = _cleanup_empty_internal_fences(text)
+    if _VISIBLE_CONTEXT_COMPACTION_PREFIX_RE.match(text):
+        return ""
+    text = _VISIBLE_RESTART_NOTE_RE.sub('', text)
+    text = _VISIBLE_TODO_PRESERVED_RE.sub('', text)
+    return _cleanup_empty_internal_fences(text)
 
 
 class StreamingContextScrubber:
@@ -222,6 +329,102 @@ class StreamingContextScrubber:
             self._at_block_boundary = text[last_newline + 1:].strip() == ""
         else:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
+
+
+class StreamingVisibleContextScrubber:
+    """Streaming counterpart to :func:`sanitize_visible_context`.
+
+    ``StreamingContextScrubber`` removes fenced ``<memory-context>`` spans
+    wherever they appear. Visible-only scaffolding such as context-compaction
+    handoffs and restart-resume notes is different: those markers are anchored
+    at the start of a *response*. A per-delta regex would leak the first chunk
+    (``"[CONTEXT"``) before the full prefix arrives, so this scrubber buffers
+    only the response prefix until it can prove the text is safe or internal.
+    """
+
+    _COMPACTION_PREFIX = "[context compaction"
+    _RESTART_PREFIX = "[system note: your previous turn in this session was interrupted"
+    _TODO_PREFIX = "[your active task list was preserved across context compression]"
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._buf = ""
+        self._decided = False
+        self._suppress_all = False
+        self._context_scrubber = StreamingContextScrubber()
+
+    def feed(self, text: str) -> str:
+        if not text or self._suppress_all:
+            return ""
+        text = self._context_scrubber.feed(text)
+        if not text:
+            return ""
+        if self._decided:
+            return sanitize_visible_context(text)
+
+        self._buf += text
+        probe = self._buf.lstrip()
+        probe_lower = probe.lower()
+
+        if not probe:
+            # Leading whitespace only — hold it until we know whether an
+            # internal marker follows.
+            return ""
+
+        if self._COMPACTION_PREFIX.startswith(probe_lower):
+            return ""
+        if probe_lower.startswith(self._COMPACTION_PREFIX):
+            # A compaction handoff is never user-visible; drop this and every
+            # later delta for the response.
+            self._buf = ""
+            self._suppress_all = True
+            return ""
+
+        if self._RESTART_PREFIX.startswith(probe_lower):
+            return ""
+        if probe_lower.startswith(self._RESTART_PREFIX):
+            close_idx = probe.find("]")
+            if close_idx == -1:
+                return ""
+            # Preserve any text after the system note. Leading whitespace that
+            # preceded the note is intentionally discarded with the note.
+            rest = probe[close_idx + 1 :]
+            self._buf = ""
+            self._decided = True
+            return sanitize_visible_context(rest).lstrip("\n")
+
+        if self._TODO_PREFIX.startswith(probe_lower):
+            return ""
+        if probe_lower.startswith(self._TODO_PREFIX):
+            stripped = sanitize_visible_context(probe)
+            if not stripped:
+                # Hold the whole preserved-task block until flush, or until a
+                # non-task answer line arrives after it.
+                return ""
+            self._buf = ""
+            self._decided = True
+            return stripped.lstrip("\n")
+
+        # The prefix is ordinary user-visible text.
+        out = self._buf
+        self._buf = ""
+        self._decided = True
+        return sanitize_visible_context(out)
+
+    def flush(self) -> str:
+        if self._suppress_all:
+            self._buf = ""
+            self._decided = True
+            return ""
+        tail_from_context = self._context_scrubber.flush()
+        if tail_from_context:
+            self._buf += tail_from_context
+        tail = self._buf
+        self._buf = ""
+        self._decided = True
+        return sanitize_visible_context(tail)
 
 
 def build_memory_context_block(raw_context: str) -> str:

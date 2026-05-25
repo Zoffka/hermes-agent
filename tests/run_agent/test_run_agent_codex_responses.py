@@ -493,6 +493,38 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_run_conversation_strips_pasted_memory_context_from_user_message(monkeypatch):
+    """Defense-in-depth: direct AIAgent calls also scrub internal context.
+
+    Gateway/platform sanitizers normally run before this, but API calls,
+    synthetic events, stale gateway processes, or direct tests can bypass those
+    layers. The current user message sent to the model must still be clean.
+    """
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_api_call(api_kwargs):
+        captured["messages"] = api_kwargs.get("messages") or api_kwargs.get("input")
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation(
+        "you back?\n\n"
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input.]\n"
+        "## User Representation\nsecret facts\n"
+        "</memory-context>"
+    )
+
+    assert result["completed"] is True
+    user_messages = [m for m in captured["messages"] if m.get("role") == "user"]
+    assert user_messages[-1]["content"] == "you back?"
+    assert "memory-context" not in user_messages[-1]["content"]
+    assert "secret facts" not in user_messages[-1]["content"]
+
+
+
 def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     """Regression: empty response.output + valid output_text should succeed,
     not trigger retry/fallback. The validation stage must defer to
@@ -1384,6 +1416,38 @@ def test_stream_delta_strips_leaked_memory_context_across_chunks(monkeypatch):
     assert "stale memory" not in combined
     assert "<memory-context>" not in combined
     assert "</memory-context>" not in combined
+
+
+def test_stream_delta_strips_streamed_compaction_handoff(monkeypatch):
+    """Regression: visible compaction summaries can be split across deltas."""
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.stream_delta_callback = observed.append
+
+    for delta in [
+        "[CONTEXT",
+        " COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n",
+        "## Active Task\nsecret handoff",
+    ]:
+        agent._fire_stream_delta(delta)
+    agent._reset_stream_delivery_tracking()
+
+    assert "".join(observed) == ""
+
+
+def test_stream_delta_strips_streamed_restart_note_prefix(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.stream_delta_callback = observed.append
+
+    for delta in [
+        "[System note: Your previous turn in this session",
+        " was interrupted by gateway restart. History intact.]\n\n",
+        "Actual answer.",
+    ]:
+        agent._fire_stream_delta(delta)
+
+    assert "".join(observed) == "Actual answer."
 
 
 def test_stream_delta_scrubber_resets_between_turns(monkeypatch):

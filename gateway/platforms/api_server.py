@@ -51,6 +51,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from agent.memory_manager import sanitize_history_context, sanitize_visible_context
 
 logger = logging.getLogger(__name__)
 
@@ -1079,14 +1080,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if role == "system":
                 # System messages don't support images (Anthropic rejects, OpenAI
                 # text-model systems don't render them).  Flatten to text.
-                content = _normalize_chat_content(raw_content)
+                content = sanitize_visible_context(_normalize_chat_content(raw_content))
                 if system_prompt is None:
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
             elif role in {"user", "assistant"}:
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = sanitize_visible_context(_normalize_multimodal_content(raw_content))
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
@@ -1145,7 +1146,15 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    history = [
+                        {
+                            **msg,
+                            "content": sanitize_history_context(msg.get("content", ""))
+                            if isinstance(msg.get("content"), str)
+                            else msg.get("content", ""),
+                        }
+                        for msg in db.get_messages_as_conversation(session_id)
+                    ]
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []

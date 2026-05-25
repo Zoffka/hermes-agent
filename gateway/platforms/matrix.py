@@ -104,6 +104,7 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
+from agent.memory_manager import sanitize_visible_context
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,80 @@ class _MatrixApprovalPrompt:
 # Matrix message size limit (4000 chars practical, spec has no hard limit
 # but clients render poorly above this).
 MAX_MESSAGE_LENGTH = 4000
+
+
+
+def _extract_reply_fallback_text(body: str) -> str:
+    """Extract the quoted Matrix reply fallback from a message body.
+
+    Matrix clients commonly send replies as plain text like::
+
+        > <@alice:example.org> Original message
+        > second quoted line
+
+        Actual reply
+
+    The gateway already strips those fallback lines before sending the user's
+    actual reply into the agent.  Preserve the quoted part separately so the
+    shared reply-to injection path can prepend ``[Replying to: "..."]``.  This
+    matters especially for cron deliveries: scheduler-sent messages are not
+    guaranteed to be in the live conversation history, but Matrix includes the
+    replied-to text in the user's reply event.
+    """
+    if not body or not body.startswith("> "):
+        return ""
+
+    quoted: list[str] = []
+    for line in body.split("\n"):
+        if line.startswith("> "):
+            quoted.append(line[2:])
+            continue
+        if line == ">":
+            quoted.append("")
+            continue
+        if line == "":
+            break
+        # Non-fallback content started without the usual blank separator.
+        break
+
+    while quoted and quoted[-1] == "":
+        quoted.pop()
+    if not quoted:
+        return ""
+
+    # Strip Matrix's leading sender marker from the first quoted line, if any.
+    # Examples: "<@alice:example.org> hello" or "* <@alice:example.org> hello".
+    first = quoted[0].strip()
+    if first.startswith("* "):
+        first = first[2:].lstrip()
+    if first.startswith("<") and ">" in first:
+        first = first.split(">", 1)[1].lstrip()
+    quoted[0] = first
+
+    # Matrix reply fallbacks quote previous messages. If the quoted message was
+    # a leaked internal memory block (for example from a cron delivery before
+    # the delivery scrubber was active), do not re-inject that raw context into
+    # the next agent prompt as ``reply_to_text``.
+    return sanitize_visible_context("\n".join(quoted).strip())
+
+
+def _strip_reply_fallback(body: str, *, has_reply: bool) -> str:
+    """Remove Matrix reply fallback quote lines from ``body``."""
+    if has_reply and body.startswith("> "):
+        lines = body.split("\n")
+        stripped = []
+        past_fallback = False
+        for line in lines:
+            if not past_fallback:
+                if line.startswith("> ") or line == ">":
+                    continue
+                if line == "":
+                    past_fallback = True
+                    continue
+                past_fallback = True
+            stripped.append(line)
+        body = "\n".join(stripped) if stripped else body
+    return body
 
 # Store directory for E2EE keys and sync state.
 # Uses get_hermes_home() so each profile gets its own Matrix store.
@@ -1834,21 +1909,10 @@ class MatrixAdapter(BasePlatformAdapter):
         if in_reply_to:
             reply_to = in_reply_to.get("event_id")
 
+        reply_to_text = _extract_reply_fallback_text(body) if reply_to else None
+
         # Strip reply fallback from body.
-        if reply_to and body.startswith("> "):
-            lines = body.split("\n")
-            stripped = []
-            past_fallback = False
-            for line in lines:
-                if not past_fallback:
-                    if line.startswith("> ") or line == ">":
-                        continue
-                    if line == "":
-                        past_fallback = True
-                        continue
-                    past_fallback = True
-                stripped.append(line)
-            body = "\n".join(stripped) if stripped else body
+        body = _strip_reply_fallback(body, has_reply=bool(reply_to))
 
         msg_type = MessageType.TEXT
         if body.startswith(("!", "/")):
@@ -1861,6 +1925,7 @@ class MatrixAdapter(BasePlatformAdapter):
             raw_message=source_content,
             message_id=event_id,
             reply_to_message_id=reply_to,
+            reply_to_text=reply_to_text,
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:

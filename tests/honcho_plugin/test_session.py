@@ -558,6 +558,32 @@ class TestConcludeToolDispatch:
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
 
+    def test_sync_turn_strips_restart_system_note_before_honcho_ingest(self):
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn(
+            (
+                "[System note: Your previous turn in this session was interrupted "
+                "by gateway restart. The conversation history below is intact.]\n"
+                "Can you cut out the noise?"
+            ),
+            "Done.",
+        )
+        provider._sync_thread.join(timeout=1.0)
+
+        assert session.add_message.call_args_list[0].args == (
+            "user",
+            "Can you cut out the noise?",
+        )
+        assert session.add_message.call_args_list[1].args == ("assistant", "Done.")
+
 
 # ---------------------------------------------------------------------------
 # Message chunking

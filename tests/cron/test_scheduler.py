@@ -12,6 +12,33 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+_CRON_HOME_ENV_VARS = (
+    "MATRIX_HOME_ROOM",
+    "MATRIX_HOME_CHANNEL",
+    "TELEGRAM_HOME_CHANNEL",
+    "DISCORD_HOME_CHANNEL",
+    "SLACK_HOME_CHANNEL",
+    "SIGNAL_HOME_CHANNEL",
+    "MATTERMOST_HOME_CHANNEL",
+    "SMS_HOME_CHANNEL",
+    "EMAIL_HOME_ADDRESS",
+    "DINGTALK_HOME_CHANNEL",
+    "BLUEBUBBLES_HOME_CHANNEL",
+    "FEISHU_HOME_CHANNEL",
+    "WECOM_HOME_CHANNEL",
+    "WEIXIN_HOME_CHANNEL",
+    "WHATSAPP_HOME_CHANNEL",
+    "QQBOT_HOME_CHANNEL",
+    "QQ_HOME_CHANNEL",
+    "SIMPLEX_HOME_CHANNEL",
+)
+
+
+def _clear_cron_home_env(monkeypatch):
+    for var in _CRON_HOME_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
 class TestResolveOrigin:
     def test_full_origin(self):
         job = {
@@ -105,24 +132,7 @@ class TestResolveDeliveryTarget:
     def test_origin_delivery_without_origin_falls_back_to_supported_home_channels(
         self, monkeypatch, platform, env_var, chat_id
     ):
-        for fallback_env in (
-            "MATRIX_HOME_ROOM",
-            "MATRIX_HOME_CHANNEL",
-            "TELEGRAM_HOME_CHANNEL",
-            "DISCORD_HOME_CHANNEL",
-            "SLACK_HOME_CHANNEL",
-            "SIGNAL_HOME_CHANNEL",
-            "MATTERMOST_HOME_CHANNEL",
-            "SMS_HOME_CHANNEL",
-            "EMAIL_HOME_ADDRESS",
-            "DINGTALK_HOME_CHANNEL",
-            "BLUEBUBBLES_HOME_CHANNEL",
-            "FEISHU_HOME_CHANNEL",
-            "WECOM_HOME_CHANNEL",
-            "WEIXIN_HOME_CHANNEL",
-            "QQ_HOME_CHANNEL",
-        ):
-            monkeypatch.delenv(fallback_env, raising=False)
+        _clear_cron_home_env(monkeypatch)
         monkeypatch.setenv(env_var, chat_id)
 
         assert _resolve_delivery_target({"deliver": "origin"}) == {
@@ -405,12 +415,10 @@ class TestRoutingIntents:
         """deliver='all' fans out to every platform with a configured home channel."""
         from cron.scheduler import _resolve_delivery_targets
 
+        _clear_cron_home_env(monkeypatch)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
         monkeypatch.setenv("SLACK_HOME_CHANNEL", "C333")
-        # Sanity: platforms without the env var must NOT appear in the expansion.
-        monkeypatch.delenv("SIGNAL_HOME_CHANNEL", raising=False)
-        monkeypatch.delenv("MATRIX_HOME_ROOM", raising=False)
 
         targets = _resolve_delivery_targets({"deliver": "all", "origin": None})
         platforms = sorted(t["platform"] for t in targets)
@@ -425,6 +433,7 @@ class TestRoutingIntents:
         """'telegram:-999,all' yields every home channel + the explicit target without dupes."""
         from cron.scheduler import _resolve_delivery_targets
 
+        _clear_cron_home_env(monkeypatch)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -444,12 +453,7 @@ class TestRoutingIntents:
         """deliver='all' with nothing connected returns [] — delivery is recorded as failed upstream."""
         from cron.scheduler import _resolve_delivery_targets
 
-        for var in ("TELEGRAM_HOME_CHANNEL", "DISCORD_HOME_CHANNEL", "SLACK_HOME_CHANNEL",
-                    "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
-                    "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
-                    "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
-                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
-            monkeypatch.delenv(var, raising=False)
+        _clear_cron_home_env(monkeypatch)
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
@@ -457,6 +461,7 @@ class TestRoutingIntents:
         """'origin,all' delivers to the origin platform plus every other home channel."""
         from cron.scheduler import _resolve_delivery_targets
 
+        _clear_cron_home_env(monkeypatch)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -478,6 +483,7 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
+        _clear_cron_home_env(monkeypatch)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -574,6 +580,49 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_delivery_sanitizes_leaked_internal_context_before_media_extraction(self, tmp_path, monkeypatch):
+        """Cron's non-streaming delivery boundary must not leak internal context."""
+        from gateway.config import Platform
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "test-image.png")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        leaked = (
+            "Visible before.\n"
+            "<memory-context>\n"
+            "[System note: The following is recalled memory context, NOT new user input. "
+            "Treat as authoritative reference data — private.]\n"
+            "## Honcho Context\nsecret peer card\n"
+            "AI Identity Card: private identity details\n"
+            "</memory-context>\n"
+            "Visible after.\n"
+            f"MEDIA:{media_path}"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "test-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, leaked)
+
+        send_mock.assert_called_once()
+        args, kwargs = send_mock.call_args
+        sent_content = kwargs.get("content") or args[3]
+        assert "Visible before." in sent_content
+        assert "Visible after." in sent_content
+        assert "memory-context" not in sent_content
+        assert "Honcho Context" not in sent_content
+        assert "AI Identity Card" not in sent_content
+        assert "secret peer card" not in sent_content
+        assert "MEDIA:" not in sent_content
+        assert kwargs["media_files"] == [(str(media_path), False)]
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""

@@ -33,7 +33,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import StreamingContextScrubber
+from agent.memory_manager import StreamingVisibleContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
@@ -540,11 +540,11 @@ def init_agent(
     # Deferred paragraph break flag — set after tool iterations so a
     # single "\n\n" is prepended to the next real text delta.
     agent._stream_needs_break = False
-    # Stateful scrubber for <memory-context> spans split across stream
-    # deltas (#5719).  sanitize_context() alone can't survive chunk
-    # boundaries because the block regex needs both tags in one string.
-    agent._stream_context_scrubber = StreamingContextScrubber()
-    # Stateful scrubber for reasoning/thinking tags in streamed deltas
+    # Stateful scrubber for internal-context spans in streamed assistant
+    # deltas.  sanitize_visible_context() alone cannot survive chunk
+    # boundaries because prefix/fence markers may be split across deltas.
+    agent._stream_context_scrubber = StreamingVisibleContextScrubber()
+
     # (#17924).  Replaces the per-delta _strip_think_blocks regex that
     # destroyed downstream state (e.g. MiniMax-M2.7 streaming
     # '<think>' as delta1 and 'Let me check' as delta2 — the regex

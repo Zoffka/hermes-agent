@@ -1015,6 +1015,7 @@ from gateway.platforms.base import (
     MessageType,
     _reply_anchor_for_event,
     merge_pending_message_event,
+    sanitize_internal_context_from_event,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -6612,6 +6613,11 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        # Defense in depth: most adapters sanitize in BasePlatformAdapter.handle_message(),
+        # but tests, synthetic events, hooks, and any adapter that calls the runner
+        # directly can bypass that platform boundary. Scrub here too before auth,
+        # command routing, queueing, transcript writes, or agent prompt assembly.
+        sanitize_internal_context_from_event(event)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -6653,6 +6659,7 @@ class GatewayRunner:
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
                         event = dataclasses.replace(event, text=_new_text)
+                        sanitize_internal_context_from_event(event)
                         source = event.source
                     break
                 if _action == "allow":
@@ -11640,6 +11647,16 @@ class GatewayRunner:
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+
+            # Strip internal memory/context scaffolding before media parsing or
+            # chat delivery. Background tasks bypass BasePlatform.process_event,
+            # so they need the same visible-boundary scrub explicitly here.
+            if response:
+                try:
+                    from agent.memory_manager import sanitize_visible_context
+                    response = sanitize_visible_context(response)
+                except Exception:
+                    pass
 
             # Extract media files from the response
             if response:

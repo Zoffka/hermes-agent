@@ -153,6 +153,9 @@ def _make_fake_mautrix():
         def __init__(self, client=None, crypto_store=None, state_store=None):
             self.share_keys_min_trust = None
             self.send_keys_min_trust = None
+            self.account = MagicMock()
+            self.account.identity_keys = {"ed25519": "fake_ed25519_key"}
+            self.account.shared = True
 
         async def load(self):
             pass
@@ -484,23 +487,63 @@ class TestMatrixReplyFallbackStripping:
         self.adapter._message_handler = AsyncMock()
 
     def _strip_fallback(self, body: str, has_reply: bool = True) -> str:
-        """Simulate the reply fallback stripping logic from _on_room_message."""
-        reply_to = "some_event_id" if has_reply else None
-        if reply_to and body.startswith("> "):
-            lines = body.split("\n")
-            stripped = []
-            past_fallback = False
-            for line in lines:
-                if not past_fallback:
-                    if line.startswith("> ") or line == ">":
-                        continue
-                    if line == "":
-                        past_fallback = True
-                        continue
-                    past_fallback = True
-                stripped.append(line)
-            body = "\n".join(stripped) if stripped else body
-        return body
+        from gateway.platforms.matrix import _strip_reply_fallback
+
+        return _strip_reply_fallback(body, has_reply=has_reply)
+
+    def test_reply_fallback_text_extracts_original_message(self):
+        from gateway.platforms.matrix import _extract_reply_fallback_text
+
+        body = "> <@bot:example.org> ⏰ **daily-report**\n> `job_id: abc123`\n>\n> Output line\n\nWhat happened here?"
+
+        assert _extract_reply_fallback_text(body) == "⏰ **daily-report**\n`job_id: abc123`\n\nOutput line"
+
+    def test_reply_fallback_text_strips_restart_note(self):
+        from gateway.platforms.matrix import _extract_reply_fallback_text
+
+        body = (
+            "> <@bot:example.org> [System note: Your previous turn in this session was interrupted by gateway restart.]\n"
+            "> Clean quoted bit\n"
+            "\n"
+            "back?"
+        )
+
+        assert _extract_reply_fallback_text(body) == "Clean quoted bit"
+
+    @pytest.mark.asyncio
+    async def test_handle_text_message_sets_reply_to_text_from_fallback(self):
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Michal")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._text_batch_delay_seconds = 0
+
+        body = "> <@bot:example.org> ⏰ **backup-watch**\n> `job_id: cron-1`\n>\n> Backup failed\n\nCan you fix this?"
+        source_content = {
+            "msgtype": "m.text",
+            "body": body,
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$cron_event"}},
+        }
+
+        await self.adapter._handle_text_message(
+            "!room:example.org",
+            "@elkim:example.org",
+            "$reply_event",
+            0.0,
+            source_content,
+            source_content["m.relates_to"],
+        )
+
+        assert captured_event is not None
+        assert captured_event.text == "Can you fix this?"
+        assert captured_event.reply_to_message_id == "$cron_event"
+        assert captured_event.reply_to_text == "⏰ **backup-watch**\n`job_id: cron-1`\n\nBackup failed"
 
     def test_simple_reply_fallback(self):
         body = "> <@alice:ex.org> Original message\n\nActual reply"
@@ -1200,6 +1243,11 @@ class TestMatrixPasswordLoginDeviceId:
         mock_client.crypto = None
         mock_client.login = AsyncMock(return_value=MagicMock(device_id="STABLE_PW_DEVICE", access_token="tok"))
         mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.query_keys = AsyncMock(return_value={
+            "device_keys": {"@bot:example.org": {"STABLE_PW_DEVICE": {
+                "keys": {"ed25519:STABLE_PW_DEVICE": "fake_ed25519_key"},
+            }}}
+        })
         mock_client.add_event_handler = MagicMock()
         mock_client.api = MagicMock()
         mock_client.api.token = ""
