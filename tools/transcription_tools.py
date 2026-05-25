@@ -26,8 +26,10 @@ Usage::
         print(result["transcript"])
 """
 
+import base64
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -84,6 +86,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_OPENROUTER_STT_MODEL = os.getenv("STT_OPENROUTER_MODEL", "openai/gpt-audio-mini")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -91,6 +94,7 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -298,6 +302,14 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "openrouter":
+            if get_env_value("OPENROUTER_API_KEY"):
+                return "openrouter"
+            logger.warning(
+                "STT provider 'openrouter' configured but OPENROUTER_API_KEY is not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
     # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
@@ -325,6 +337,9 @@ def _get_provider(stt_config: dict) -> str:
             return "xai"
     except Exception:
         pass
+    if get_env_value("OPENROUTER_API_KEY"):
+        logger.info("No local STT available, using OpenRouter audio model")
+        return "openrouter"
     return "none"
 
 # ---------------------------------------------------------------------------
@@ -440,14 +455,19 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
+        stt_config = _load_stt_config()
+        local_cfg = stt_config.get("local", {}) if isinstance(stt_config, dict) else {}
         _forced_lang = (
-            _load_stt_config().get("local", {}).get("language")
+            local_cfg.get("language")
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
-        transcribe_kwargs = {"beam_size": 5}
+        transcribe_kwargs = {"beam_size": int(local_cfg.get("beam_size", 5) or 5)}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+        initial_prompt = str(local_cfg.get("initial_prompt") or "").strip()
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = initial_prompt
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
@@ -834,6 +854,220 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# STT transcript post-processing
+# ---------------------------------------------------------------------------
+
+
+def _postprocess_stt_transcript(transcript: str, stt_config: Optional[dict] = None) -> str:
+    """Apply lightweight, explicit corrections for recurring voice-note misses.
+
+    This is intentionally conservative: defaults only cover Hermes/STT vocabulary
+    that repeatedly gets normalized into ordinary English or sex-ed nonsense.
+    Users can add more regex replacements under ``stt.corrections`` as
+    ``pattern: replacement`` pairs.
+    """
+    text = transcript.strip()
+    if not text:
+        return text
+
+    corrections: Dict[str, str] = {
+        r"\bSTD\b": "STT",
+        r"\bs[-\s]?t[-\s]?t\b": "STT",
+        r"\bopen\s+another\s+one\b": "OpenRouter",
+        r"\bopen\s+other\s+one\b": "OpenRouter",
+        r"\bopen\s+router\b": "OpenRouter",
+        r"\bx\s*a\s*i\b": "xAI",
+    }
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    extra = stt_config.get("corrections", {}) if isinstance(stt_config, dict) else {}
+    if isinstance(extra, dict):
+        for pattern, replacement in extra.items():
+            if isinstance(pattern, str) and isinstance(replacement, str):
+                corrections[pattern] = replacement
+
+    for pattern, replacement in corrections.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Provider: OpenRouter audio models
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_openrouter(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using an OpenRouter audio-capable chat model.
+
+    OpenRouter exposes OpenAI audio models through Chat Completions with an
+    ``input_audio`` content part. We use text-only output and ask for a strict
+    transcript so the gateway can treat it like every other STT provider.
+    """
+    api_key = get_env_value("OPENROUTER_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "OPENROUTER_API_KEY not set"}
+
+    stt_config = _load_stt_config()
+    openrouter_cfg = stt_config.get("openrouter", {})
+    base_url = str(
+        openrouter_cfg.get("base_url")
+        or get_env_value("OPENROUTER_BASE_URL")
+        or OPENROUTER_BASE_URL
+    ).strip().rstrip("/")
+    language = str(openrouter_cfg.get("language") or DEFAULT_LOCAL_STT_LANGUAGE).strip()
+
+    suffix = Path(file_path).suffix.lower().lstrip(".")
+    # OpenAI audio chat input only reliably accepts mp3/wav. Matrix voice notes
+    # commonly arrive as OGG/Opus, which OpenRouter forwards to OpenAI as a 400
+    # "Provider returned error" unless we normalize first.
+    source_path = Path(file_path)
+    converted_path: Optional[Path] = None
+    audio_format = "mp3" if suffix in {"mp3", "mpeg", "mpga"} else suffix
+    if audio_format not in {"mp3", "wav"}:
+        ffmpeg = _find_ffmpeg_binary()
+        if not ffmpeg:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "OpenRouter STT needs ffmpeg to convert this audio format to mp3",
+            }
+        fd, tmp_name = tempfile.mkstemp(suffix=".mp3", prefix="hermes-openrouter-stt-")
+        os.close(fd)
+        converted_path = Path(tmp_name)
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            str(converted_path),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        if proc.returncode != 0:
+            try:
+                converted_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"OpenRouter STT audio conversion failed: {proc.stderr.strip()[:300]}",
+            }
+        source_path = converted_path
+        audio_format = "mp3"
+
+    try:
+        import requests
+
+        encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+        transcript_instruction = (
+            "Transcribe this audio exactly. Return only the transcript text, no commentary. "
+            "Use the conversation vocabulary when acoustically plausible: OpenRouter, STT, xAI, Hermes, Matrix. "
+            "If the audio sounds like 'open router', write 'OpenRouter'. "
+            "If it sounds like 'S T T', write 'STT', not STD."
+        )
+        if language:
+            transcript_instruction += f" The expected spoken language is {language}."
+
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://hermes.local",
+                "X-Title": "Hermes STT",
+            },
+            json={
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": transcript_instruction},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": encoded, "format": audio_format},
+                            },
+                        ],
+                    }
+                ],
+                "modalities": ["text"],
+                "temperature": 0,
+            },
+            timeout=120,
+        )
+        if converted_path is not None:
+            try:
+                converted_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_body = response.json()
+                detail = err_body.get("error", {}).get("message", "") or response.text[:300]
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"OpenRouter STT API error (HTTP {response.status_code}): {detail}",
+            }
+
+        result = response.json()
+        transcript_text = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        transcript_text = _extract_transcript_text(transcript_text)
+        transcript_text = _postprocess_stt_transcript(transcript_text, stt_config)
+        if not transcript_text:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "OpenRouter STT returned empty transcript",
+            }
+
+        logger.info(
+            "Transcribed %s via OpenRouter STT (%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "openrouter"}
+
+    except PermissionError:
+        if converted_path is not None:
+            try:
+                converted_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        if converted_path is not None:
+            try:
+                converted_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        logger.error("OpenRouter STT transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"OpenRouter STT transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -905,6 +1139,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         # xAI Grok STT doesn't use a model parameter — pass through for logging
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
+
+    if provider == "openrouter":
+        openrouter_cfg = stt_config.get("openrouter", {})
+        model_name = model or openrouter_cfg.get("model", DEFAULT_OPENROUTER_STT_MODEL)
+        return _transcribe_openrouter(file_path, model_name)
 
     # No provider available
     return {

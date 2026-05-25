@@ -52,6 +52,9 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("STT_OPENROUTER_MODEL", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
@@ -1367,6 +1370,187 @@ class TestTranscribeAudioXAIDispatch:
 
         assert mock_xai.call_args[0][1] == "custom-stt"
 
+
+# ============================================================================
+# _transcribe_openrouter
+# ============================================================================
+
+class TestTranscribeOpenRouter:
+    def test_no_key(self, monkeypatch, sample_wav):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        from tools.transcription_tools import _transcribe_openrouter
+        result = _transcribe_openrouter(sample_wav, "openai/gpt-audio-mini")
+        assert result["success"] is False
+        assert "OPENROUTER_API_KEY" in result["error"]
+
+    def test_successful_transcription_posts_audio_chat_payload(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": " open router and STD "}}]
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"openrouter": {"language": "en"}}), \
+             patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_openrouter
+            result = _transcribe_openrouter(sample_wav, "openai/gpt-audio-mini")
+
+        assert result["success"] is True
+        assert result["provider"] == "openrouter"
+        assert result["transcript"] == "OpenRouter and STT"
+        call = mock_post.call_args
+        url = call.args[0] if call.args else call.kwargs["url"]
+        payload = call.kwargs["json"]
+        headers = call.kwargs["headers"]
+        assert url == "https://openrouter.ai/api/v1/chat/completions"
+        assert headers["Authorization"] == "Bearer or-test-key"
+        assert payload["model"] == "openai/gpt-audio-mini"
+        assert payload["modalities"] == ["text"]
+        assert payload["temperature"] == 0
+        content = payload["messages"][0]["content"]
+        assert content[1]["type"] == "input_audio"
+        assert content[1]["input_audio"]["format"] == "wav"
+        assert content[1]["input_audio"]["data"]
+
+    def test_api_error_returns_failure(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = '{"error":{"message":"bad audio"}}'
+        mock_response.json.return_value = {"error": {"message": "bad audio"}}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("requests.post", return_value=mock_response):
+            from tools.transcription_tools import _transcribe_openrouter
+            result = _transcribe_openrouter(sample_wav, "openai/gpt-audio-mini")
+
+        assert result["success"] is False
+        assert "HTTP 400" in result["error"]
+        assert "bad audio" in result["error"]
+
+    def test_empty_transcript_returns_failure(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": [{"message": {"content": "   "}}]}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("requests.post", return_value=mock_response):
+            from tools.transcription_tools import _transcribe_openrouter
+            result = _transcribe_openrouter(sample_wav, "openai/gpt-audio-mini")
+
+        assert result["success"] is False
+        assert "empty transcript" in result["error"]
+
+    def test_converts_ogg_to_mp3_and_cleans_temp_file(self, monkeypatch, sample_ogg, tmp_path):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+        converted = tmp_path / "converted.mp3"
+        converted.write_bytes(b"converted audio")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": [{"message": {"content": "hello"}}]}
+
+        def fake_mkstemp(*, suffix, prefix):
+            assert suffix == ".mp3"
+            assert prefix == "hermes-openrouter-stt-"
+            fd = os.open(converted, os.O_RDWR)
+            return fd, str(converted)
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._find_ffmpeg_binary", return_value="/usr/bin/ffmpeg"), \
+             patch("tools.transcription_tools.tempfile.mkstemp", side_effect=fake_mkstemp), \
+             patch("tools.transcription_tools.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as mock_run, \
+             patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_openrouter
+            result = _transcribe_openrouter(sample_ogg, "openai/gpt-audio-mini")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hello"
+        assert not converted.exists()
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == "/usr/bin/ffmpeg"
+        assert str(converted) in cmd
+        audio = mock_post.call_args.kwargs["json"]["messages"][0]["content"][1]["input_audio"]
+        assert audio["format"] == "mp3"
+
+    def test_conversion_failure_cleans_temp_file(self, monkeypatch, sample_ogg, tmp_path):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+        converted = tmp_path / "failed.mp3"
+        converted.write_bytes(b"partial")
+
+        def fake_mkstemp(*, suffix, prefix):
+            fd = os.open(converted, os.O_RDWR)
+            return fd, str(converted)
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._find_ffmpeg_binary", return_value="/usr/bin/ffmpeg"), \
+             patch("tools.transcription_tools.tempfile.mkstemp", side_effect=fake_mkstemp), \
+             patch("tools.transcription_tools.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "", "broken codec")):
+            from tools.transcription_tools import _transcribe_openrouter
+            result = _transcribe_openrouter(sample_ogg, "openai/gpt-audio-mini")
+
+        assert result["success"] is False
+        assert "conversion failed" in result["error"]
+        assert not converted.exists()
+
+
+# ============================================================================
+# _get_provider — OpenRouter
+# ============================================================================
+
+class TestGetProviderOpenRouter:
+    def test_openrouter_when_key_set(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
+        from tools.transcription_tools import _get_provider
+        assert _get_provider({"provider": "openrouter"}) == "openrouter"
+
+    def test_openrouter_explicit_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        from tools.transcription_tools import _get_provider
+        assert _get_provider({"provider": "openrouter"}) == "none"
+
+
+# ============================================================================
+# transcribe_audio — OpenRouter dispatch
+# ============================================================================
+
+class TestTranscribeAudioOpenRouterDispatch:
+    def test_dispatches_to_openrouter(self, sample_wav):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
+             patch("tools.transcription_tools._get_provider", return_value="openrouter"), \
+             patch("tools.transcription_tools._transcribe_openrouter",
+                   return_value={"success": True, "transcript": "hi", "provider": "openrouter"}) as mock_openrouter:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        assert result["provider"] == "openrouter"
+        mock_openrouter.assert_called_once()
+        assert mock_openrouter.call_args.args[1] == "openai/gpt-audio-mini"
+
+    def test_configured_openrouter_model_used(self, sample_wav):
+        config = {"provider": "openrouter", "openrouter": {"model": "openai/gpt-audio"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="openrouter"), \
+             patch("tools.transcription_tools._transcribe_openrouter",
+                   return_value={"success": True, "transcript": "hi"}) as mock_openrouter:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_wav, model=None)
+
+        assert mock_openrouter.call_args.args[1] == "openai/gpt-audio"
+
+    def test_model_override_passed_to_openrouter(self, sample_wav):
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_provider", return_value="openrouter"), \
+             patch("tools.transcription_tools._transcribe_openrouter",
+                   return_value={"success": True, "transcript": "hi"}) as mock_openrouter:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_wav, model="custom/audio-model")
+
+        assert mock_openrouter.call_args.args[1] == "custom/audio-model"
 
 # ============================================================================
 # Shell safety — shlex.split on auto-detected templates

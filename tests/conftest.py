@@ -305,6 +305,14 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
+    # API server runtime knobs are non-secret, but developer/gateway env
+    # values change default-host/model/CORS assertions and can override
+    # per-test config.yaml fixtures.
+    "API_SERVER_ENABLED",
+    "API_SERVER_HOST",
+    "API_SERVER_PORT",
+    "API_SERVER_MODEL_NAME",
+    "API_SERVER_CORS_ORIGINS",
 })
 
 
